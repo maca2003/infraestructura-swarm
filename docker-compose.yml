@@ -1,0 +1,110 @@
+# Definición de todos los servicios del sistema.
+# - En local:  docker compose build  (construye las imágenes desde los repos hermanos)
+# - En Swarm:  docker stack deploy -c docker-compose.yml sistema  (la clave "build" se ignora)
+x-servicio: &servicio
+  networks: [backend]
+  depends_on: [mysql]     # solo se usa en local; Swarm reinicia el servicio hasta que MySQL esté listo
+
+x-despliegue: &despliegue
+  restart_policy:
+    condition: on-failure
+    delay: 10s
+  update_config:          # actualización sin cortes: una réplica a la vez
+    parallelism: 1
+    delay: 10s
+    order: start-first
+    failure_action: rollback
+  rollback_config:
+    parallelism: 1
+  resources:
+    limits:
+      memory: 512M
+    reservations:
+      memory: 256M
+
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD:-root}
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks: [backend]
+    deploy:
+      replicas: 1
+      placement:
+        constraints: [node.role == manager]   # el volumen de datos queda siempre en el mismo nodo
+      restart_policy:
+        condition: on-failure
+
+  ms-auth:
+    <<: *servicio
+    image: ${REGISTRY:-local}/ms-auth:${TAG:-latest}
+    build: ../ms-auth
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+    deploy:
+      <<: *despliegue
+      replicas: 2
+
+  ms-productos:
+    <<: *servicio
+    image: ${REGISTRY:-local}/ms-productos:${TAG:-latest}
+    build: ../ms-productos
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+    deploy:
+      <<: *despliegue
+      replicas: 2
+
+  ms-inventario:
+    <<: *servicio
+    image: ${REGISTRY:-local}/ms-inventario:${TAG:-latest}
+    build: ../ms-inventario
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+      SQS_ALERTAS_URL: ${SQS_ALERTAS_URL:-}
+      AWS_REGION: us-east-1
+    deploy:
+      <<: *despliegue
+      replicas: 2
+
+  ms-ventas:
+    <<: *servicio
+    image: ${REGISTRY:-local}/ms-ventas:${TAG:-latest}
+    build: ../ms-ventas
+    environment:
+      DB_HOST: mysql
+      DB_PASSWORD: ${DB_PASSWORD:-root}
+      PRODUCTOS_URL: http://ms-productos:8082
+      INVENTARIO_URL: http://ms-inventario:8084
+    deploy:
+      <<: *despliegue
+      replicas: 2
+
+  # Único servicio publicado: todo el tráfico externo entra por aquí
+  api-gateway:
+    <<: *servicio
+    image: ${REGISTRY:-local}/api-gateway:${TAG:-latest}
+    build: ../api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      AUTH_URL: http://ms-auth:8081
+      PRODUCTOS_URL: http://ms-productos:8082
+      VENTAS_URL: http://ms-ventas:8083
+      INVENTARIO_URL: http://ms-inventario:8084
+    deploy:
+      <<: *despliegue
+      replicas: 2
+
+# En Swarm la red se crea como "overlay" (comunica contenedores en distintos nodos);
+# en docker compose local se crea como "bridge".
+networks:
+  backend:
+
+volumes:
+  mysql_data:
