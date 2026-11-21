@@ -1,0 +1,178 @@
+name: CI/CD infraestructura (Swarm + API Gateway)
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  STACK_CLUSTER: cluster-swarm
+  STACK_FUNCION: fn-alertas-inventario
+  SSH_OPTS: -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i llave.pem
+
+jobs:
+  # 1. Valida las plantillas de infraestructura como código
+  validar:
+    name: Validar plantillas
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validar CloudFormation (cfn-lint)
+        run: |
+          pip install cfn-lint
+          cfn-lint cloudformation/cluster.yaml
+
+  # 2. Provisiona en AWS: 3 instancias EC2, grupo de seguridad, IP fija y Amazon API Gateway
+  provisionar:
+    name: Provisionar infraestructura cloud
+    needs: validar
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      ip_manager: ${{ steps.salidas.outputs.ip_manager }}
+      ip_worker1: ${{ steps.salidas.outputs.ip_worker1 }}
+      ip_worker2: ${{ steps.salidas.outputs.ip_worker2 }}
+      ip_privada_manager: ${{ steps.salidas.outputs.ip_privada_manager }}
+      url_api: ${{ steps.salidas.outputs.url_api }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credenciales AWS (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Desplegar stack de CloudFormation
+        run: |
+          aws cloudformation deploy \
+            --stack-name "$STACK_CLUSTER" \
+            --template-file cloudformation/cluster.yaml \
+            --no-fail-on-empty-changeset
+
+      - name: Leer salidas del stack
+        id: salidas
+        run: |
+          salida() {
+            aws cloudformation describe-stacks --stack-name "$STACK_CLUSTER" \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" --output text
+          }
+          echo "ip_manager=$(salida IpPublicaManager)" >> "$GITHUB_OUTPUT"
+          echo "ip_privada_manager=$(salida IpPrivadaManager)" >> "$GITHUB_OUTPUT"
+          echo "ip_worker1=$(salida IpPrivadaWorker1)" >> "$GITHUB_OUTPUT"
+          echo "ip_worker2=$(salida IpPrivadaWorker2)" >> "$GITHUB_OUTPUT"
+          echo "url_api=$(salida UrlApiGateway)" >> "$GITHUB_OUTPUT"
+
+  # 3. Inicializa el clúster Swarm y une los workers
+  configurar-swarm:
+    name: Configurar clúster Docker Swarm
+    needs: provisionar
+    runs-on: ubuntu-latest
+    env:
+      MANAGER: ec2-user@${{ needs.provisionar.outputs.ip_manager }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Preparar llave SSH
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > llave.pem
+          chmod 600 llave.pem
+
+      - name: Esperar a que el manager acepte SSH
+        run: |
+          for i in $(seq 1 30); do
+            ssh $SSH_OPTS "$MANAGER" true && exit 0
+            echo "Reintentando ($i)..."; sleep 10
+          done
+          exit 1
+
+      - name: Inicializar Swarm en el manager
+        run: |
+          scp $SSH_OPTS scripts/init-swarm.sh scripts/join-swarm.sh "$MANAGER":~
+          ssh $SSH_OPTS "$MANAGER" "sudo bash ~/init-swarm.sh"
+
+      - name: Unir los workers al clúster
+        run: |
+          TOKEN=$(ssh $SSH_OPTS "$MANAGER" "sudo docker swarm join-token -q worker")
+          IP_MANAGER=${{ needs.provisionar.outputs.ip_privada_manager }}
+          # Los workers se alcanzan por su IP privada usando el manager como salto
+          SALTO="ProxyCommand=ssh $SSH_OPTS -W %h:%p $MANAGER"
+          for WORKER in ${{ needs.provisionar.outputs.ip_worker1 }} ${{ needs.provisionar.outputs.ip_worker2 }}; do
+            for i in $(seq 1 30); do
+              ssh $SSH_OPTS -o "$SALTO" "ec2-user@$WORKER" true && break
+              echo "Esperando worker $WORKER ($i)..."; sleep 10
+            done
+            scp $SSH_OPTS -o "$SALTO" scripts/join-swarm.sh "ec2-user@$WORKER":~
+            ssh $SSH_OPTS -o "$SALTO" "ec2-user@$WORKER" "sudo bash ~/join-swarm.sh $TOKEN $IP_MANAGER"
+          done
+
+      - name: Nodos del clúster
+        run: ssh $SSH_OPTS "$MANAGER" "sudo docker node ls"
+
+  # 4. Despliega el stack de microservicios en el clúster
+  desplegar:
+    name: Desplegar stack en Swarm
+    needs: [provisionar, configurar-swarm]
+    runs-on: ubuntu-latest
+    env:
+      MANAGER: ec2-user@${{ needs.provisionar.outputs.ip_manager }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credenciales AWS (Learner Lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Obtener registro ECR y URL de la cola SQS
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "REGISTRY=${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com" >> "$GITHUB_ENV"
+          SQS_URL=$(aws cloudformation describe-stacks --stack-name "$STACK_FUNCION" \
+            --query "Stacks[0].Outputs[?OutputKey=='ColaAlertasUrl'].OutputValue" --output text 2>/dev/null || true)
+          echo "SQS_ALERTAS_URL=${SQS_URL}" >> "$GITHUB_ENV"
+
+      - name: Preparar llave SSH
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > llave.pem
+          chmod 600 llave.pem
+
+      - name: Copiar archivos al manager
+        run: |
+          ssh $SSH_OPTS "$MANAGER" "mkdir -p ~/sistema/scripts"
+          scp $SSH_OPTS docker-compose.yml "$MANAGER":~/sistema/
+          scp $SSH_OPTS scripts/deploy-stack.sh "$MANAGER":~/sistema/scripts/
+
+      - name: docker stack deploy
+        run: |
+          ssh $SSH_OPTS "$MANAGER" \
+            "sudo REGISTRY='$REGISTRY' DB_PASSWORD='${{ secrets.DB_PASSWORD }}' SQS_ALERTAS_URL='$SQS_ALERTAS_URL' bash ~/sistema/scripts/deploy-stack.sh"
+
+  # 5. Prueba de humo a través de Amazon API Gateway
+  verificar:
+    name: Verificar sistema en la nube
+    needs: [provisionar, desplegar]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login a través de Amazon API Gateway
+        run: |
+          URL="${{ needs.provisionar.outputs.url_api }}/api/auth/login"
+          for i in $(seq 1 30); do
+            CODIGO=$(curl -s -o respuesta.json -w "%{http_code}" -X POST "$URL" \
+              -H "Content-Type: application/json" \
+              -d '{"username":"admin","password":"admin123"}' || true)
+            if [ "$CODIGO" = "200" ]; then
+              echo "Sistema disponible en ${{ needs.provisionar.outputs.url_api }}"
+              exit 0
+            fi
+            echo "Respuesta $CODIGO, reintentando ($i)..."; sleep 20
+          done
+          exit 1

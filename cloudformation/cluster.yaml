@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Cluster Docker Swarm en EC2 (1 manager + 2 workers) y Amazon API Gateway (HTTP API)
+  como punto de entrada publico al API Gateway del sistema (Spring Cloud Gateway).
+
+Parameters:
+  TipoInstancia:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.small, t3.medium, t3.large]
+  NombreLlave:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: vockey # llave por defecto de AWS Academy Learner Lab
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Resources:
+  # ---------- Red ----------
+  GrupoSeguridad:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Nodos del cluster Docker Swarm
+      SecurityGroupIngress:
+        - Description: SSH (pipeline CI/CD y administracion)
+          IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - Description: API Gateway del sistema (Spring Cloud Gateway)
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+  # Puertos que Docker Swarm necesita entre los nodos (solo dentro del grupo)
+  SwarmGestion:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GrupoSeguridad.GroupId
+      Description: Gestion del cluster (Raft)
+      IpProtocol: tcp
+      FromPort: 2377
+      ToPort: 2377
+      SourceSecurityGroupId: !GetAtt GrupoSeguridad.GroupId
+  SwarmNodosTcp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GrupoSeguridad.GroupId
+      Description: Comunicacion entre nodos
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !GetAtt GrupoSeguridad.GroupId
+  SwarmNodosUdp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GrupoSeguridad.GroupId
+      Description: Comunicacion entre nodos
+      IpProtocol: udp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !GetAtt GrupoSeguridad.GroupId
+  SwarmOverlay:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt GrupoSeguridad.GroupId
+      Description: Red overlay (VXLAN)
+      IpProtocol: udp
+      FromPort: 4789
+      ToPort: 4789
+      SourceSecurityGroupId: !GetAtt GrupoSeguridad.GroupId
+
+  # ---------- Nodos ----------
+  NodoManager:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref TipoInstancia
+      KeyName: !Ref NombreLlave
+      IamInstanceProfile: LabInstanceProfile # permite a los contenedores usar ECR y SQS
+      SecurityGroupIds: [!GetAtt GrupoSeguridad.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2 # necesario para que los contenedores lean las credenciales del rol
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+      Tags:
+        - Key: Name
+          Value: swarm-manager
+
+  NodoWorker1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref TipoInstancia
+      KeyName: !Ref NombreLlave
+      IamInstanceProfile: LabInstanceProfile
+      SecurityGroupIds: [!GetAtt GrupoSeguridad.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+      Tags:
+        - Key: Name
+          Value: swarm-worker-1
+
+  NodoWorker2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref TipoInstancia
+      KeyName: !Ref NombreLlave
+      IamInstanceProfile: LabInstanceProfile
+      SecurityGroupIds: [!GetAtt GrupoSeguridad.GroupId]
+      MetadataOptions:
+        HttpTokens: required
+        HttpPutResponseHopLimit: 2
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y docker
+          systemctl enable --now docker
+          usermod -aG docker ec2-user
+      Tags:
+        - Key: Name
+          Value: swarm-worker-2
+
+  # IP fija para el manager (no cambia al reiniciar el laboratorio)
+  IpManager:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      InstanceId: !Ref NodoManager
+
+  # ---------- Amazon API Gateway (HTTP API) ----------
+  ApiPublica:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: sistema-api
+      ProtocolType: HTTP
+      Description: Punto de entrada publico al sistema de microservicios
+
+  IntegracionSwarm:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref ApiPublica
+      IntegrationType: HTTP_PROXY
+      IntegrationMethod: ANY
+      IntegrationUri: !Sub http://${IpManager}:8080/{proxy}
+      PayloadFormatVersion: "1.0"
+
+  RutaProxy:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref ApiPublica
+      RouteKey: ANY /{proxy+}
+      Target: !Sub integrations/${IntegracionSwarm}
+
+  EtapaDefault:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref ApiPublica
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        # Limite de peticiones para proteger el backend
+        ThrottlingRateLimit: 20
+        ThrottlingBurstLimit: 50
+
+Outputs:
+  IpPublicaManager:
+    Description: IP publica fija del nodo manager (secret EC2_HOST)
+    Value: !Ref IpManager
+  IpPrivadaManager:
+    Value: !GetAtt NodoManager.PrivateIp
+  IpPrivadaWorker1:
+    Value: !GetAtt NodoWorker1.PrivateIp
+  IpPrivadaWorker2:
+    Value: !GetAtt NodoWorker2.PrivateIp
+  UrlApiGateway:
+    Description: URL publica del sistema (Amazon API Gateway)
+    Value: !Sub https://${ApiPublica}.execute-api.${AWS::Region}.amazonaws.com
