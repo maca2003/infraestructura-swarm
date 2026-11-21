@@ -19,7 +19,7 @@ jobs:
     name: Validar plantillas
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Validar CloudFormation (cfn-lint)
         run: |
           pip install cfn-lint
@@ -38,7 +38,7 @@ jobs:
       ip_privada_manager: ${{ steps.salidas.outputs.ip_privada_manager }}
       url_api: ${{ steps.salidas.outputs.url_api }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Credenciales AWS (Learner Lab)
         uses: aws-actions/configure-aws-credentials@v4
@@ -76,7 +76,7 @@ jobs:
     env:
       MANAGER: ec2-user@${{ needs.provisionar.outputs.ip_manager }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Preparar llave SSH
         run: |
@@ -122,7 +122,7 @@ jobs:
     env:
       MANAGER: ec2-user@${{ needs.provisionar.outputs.ip_manager }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Credenciales AWS (Learner Lab)
         uses: aws-actions/configure-aws-credentials@v4
